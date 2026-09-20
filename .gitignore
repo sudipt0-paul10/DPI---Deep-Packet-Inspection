@@ -1,0 +1,39 @@
+# Build output
+build/
+out/
+cmake-build-*/
+compile_commands.json
+CMakeFiles/
+CMakeCache.txt
+
+# Compiled artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+dpi_engine
+dpi_simple
+packet_dump
+
+# Program output. data/test_dpi.pcap is checked in deliberately; anything
+# the engine writes is not.
+output.pcap
+filtered.pcap
+*_out.pcap
+pipeline_*.pcap
+test_rules_*.conf
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
