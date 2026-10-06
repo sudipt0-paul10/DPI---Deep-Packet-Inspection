@@ -24,16 +24,17 @@ namespace DPI {
 // 4. Forwards packet to appropriate FP queue
 //
 // Load Balancing Strategy:
-// - 5-tuple hashing for flow affinity: hash(five_tuple) % num_fps selects
-//   the worker, so every packet of a given flow reaches the same FP.
+// - 5-tuple hashing for flow affinity: hash(five_tuple) % total_workers
+//   selects the global worker; this LB maps that worker to its local FP queue.
 // - This keeps per-flow state thread-local, so the FP never needs a lock
 //   to read or update it.
 // - Note: the hash is direction-sensitive, so the two directions of one
 //   connection may map to different FPs. Affinity is per unidirectional flow.
 //
 // Example with 2 LBs and 4 FPs:
-//   LB0 handles FP0, FP1 (hash % 2 == 0 or 1)
-//   LB1 handles FP2, FP3 (hash % 2 == 0 or 1, but offset by 2)
+//   global_worker = hash % 4
+//   LB = global_worker / 2
+//   FP = global_worker % 2
 //
 // ============================================================================
 
@@ -45,7 +46,8 @@ public:
     // fp_start_id: Starting FP ID for this LB's pool
     LoadBalancer(int lb_id, 
                  std::vector<ThreadSafeQueue<PacketJob>*> fp_queues,
-                 int fp_start_id);
+                 int fp_start_id,
+                 int total_workers);
     
     ~LoadBalancer();
     
@@ -77,6 +79,7 @@ private:
     int lb_id_;
     int fp_start_id_;
     int num_fps_;
+    int total_workers_;
     
     // Input queue from reader
     ThreadSafeQueue<PacketJob> input_queue_;

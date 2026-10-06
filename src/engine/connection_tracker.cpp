@@ -12,6 +12,10 @@ namespace DPI {
 
 ConnectionTracker::ConnectionTracker(int fp_id, size_t max_connections)
     : fp_id_(fp_id), max_connections_(max_connections) {
+    // Avoid repeated bucket reallocations during bursty flow creation while
+    // keeping memory bounded for configurations with many FP workers.
+    connections_.max_load_factor(0.8f);
+    connections_.reserve(std::min(max_connections_, static_cast<size_t>(4096)));
 }
 
 Connection* ConnectionTracker::getOrCreateConnection(const FiveTuple& tuple) {
@@ -33,7 +37,10 @@ Connection* ConnectionTracker::getOrCreateConnection(const FiveTuple& tuple) {
     conn.first_seen = std::chrono::steady_clock::now();
     conn.last_seen = conn.first_seen;
     
-    auto result = connections_.emplace(tuple, std::move(conn));
+    auto result = connections_.try_emplace(tuple, std::move(conn));
+    if (result.second) {
+        eviction_order_.push_back(tuple);
+    }
     total_seen_++;
     
     return &result.first->second;
@@ -109,6 +116,14 @@ size_t ConnectionTracker::cleanupStale(std::chrono::seconds timeout) {
             ++it;
         }
     }
+
+    // Rebuild the FIFO index once rather than erasing from it for every
+    // connection removed above.
+    eviction_order_.clear();
+    eviction_order_.resize(0);
+    for (const auto& entry : connections_) {
+        eviction_order_.push_back(entry.first);
+    }
     
     return removed;
 }
@@ -139,6 +154,7 @@ ConnectionTracker::TrackerStats ConnectionTracker::getStats() const {
 
 void ConnectionTracker::clear() {
     connections_.clear();
+    eviction_order_.clear();
 }
 
 void ConnectionTracker::forEach(std::function<void(const Connection&)> callback) const {
@@ -148,17 +164,11 @@ void ConnectionTracker::forEach(std::function<void(const Connection&)> callback)
 }
 
 void ConnectionTracker::evictOldest() {
-    if (connections_.empty()) return;
-    
-    // Find oldest connection
-    auto oldest = connections_.begin();
-    for (auto it = connections_.begin(); it != connections_.end(); ++it) {
-        if (it->second.last_seen < oldest->second.last_seen) {
-            oldest = it;
-        }
-    }
-    
+    if (connections_.empty() || eviction_order_.empty()) return;
+
+    const FiveTuple& oldest = eviction_order_.front();
     connections_.erase(oldest);
+    eviction_order_.pop_front();
 }
 
 // ============================================================================

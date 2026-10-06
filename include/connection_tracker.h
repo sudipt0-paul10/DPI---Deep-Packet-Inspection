@@ -3,6 +3,7 @@
 
 #include "types.h"
 #include <unordered_map>
+#include <deque>
 #include <shared_mutex>
 #include <vector>
 #include <chrono>
@@ -89,7 +90,9 @@ private:
     size_t classified_count_ = 0;
     size_t blocked_count_ = 0;
     
-    // For LRU eviction if table gets full
+    // FIFO eviction when the active-flow cap is reached. This avoids the
+    // O(n) scan that previously made sustained new-flow traffic O(n^2).
+    std::deque<FiveTuple> eviction_order_;
     void evictOldest();
 };
 

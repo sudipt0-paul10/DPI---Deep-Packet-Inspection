@@ -10,10 +10,12 @@ namespace DPI {
 
 LoadBalancer::LoadBalancer(int lb_id,
                            std::vector<ThreadSafeQueue<PacketJob>*> fp_queues,
-                           int fp_start_id)
+                           int fp_start_id,
+                           int total_workers)
     : lb_id_(lb_id),
       fp_start_id_(fp_start_id),
       num_fps_(fp_queues.size()),
+      total_workers_(total_workers),
       input_queue_(10000),
       fp_queues_(std::move(fp_queues)),
       per_fp_counts_(num_fps_) {
@@ -69,11 +71,14 @@ void LoadBalancer::run() {
 }
 
 int LoadBalancer::selectFP(const FiveTuple& tuple) {
-    // 5-tuple hashing for flow affinity: modulo maps the hash onto this LB's
-    // worker pool, so a given flow always lands on the same FP.
+    // Select from the global worker set first, then convert to this LB's
+    // local FP index. This avoids the old two-level modulo collision where
+    // hash % num_lbs and hash % fps_per_lb were correlated and could starve
+    // workers (e.g. with 2 LBs x 2 FPs, only FP0 and FP3 were reachable).
     FiveTupleHash hasher;
     size_t hash = hasher(tuple);
-    return hash % num_fps_;
+    const int global_worker = static_cast<int>(hash % static_cast<size_t>(total_workers_));
+    return global_worker - fp_start_id_;
 }
 
 LoadBalancer::LBStats LoadBalancer::getStats() const {
@@ -106,7 +111,8 @@ LBManager::LBManager(int num_lbs, int fps_per_lb,
             lb_fp_queues.push_back(fp_queues[fp_start + i]);
         }
         
-        lbs_.push_back(std::make_unique<LoadBalancer>(lb_id, lb_fp_queues, fp_start));
+        lbs_.push_back(std::make_unique<LoadBalancer>(lb_id, lb_fp_queues, fp_start,
+                                                       num_lbs * fps_per_lb));
     }
     
     std::cout << "[LBManager] Created " << num_lbs << " load balancers, "
@@ -130,10 +136,14 @@ void LBManager::stopAll() {
 }
 
 LoadBalancer& LBManager::getLBForPacket(const FiveTuple& tuple) {
-    // First level of the two-level hash: pick the LB for this flow.
+    // Map the flow onto one global worker, then select the LB owning that
+    // worker's contiguous FP range. The selected LB will derive the same
+    // global worker and choose the matching local FP queue.
     FiveTupleHash hasher;
     size_t hash = hasher(tuple);
-    int lb_index = hash % lbs_.size();
+    const int total_workers = static_cast<int>(lbs_.size()) * fps_per_lb_;
+    const int global_worker = static_cast<int>(hash % static_cast<size_t>(total_workers));
+    const int lb_index = global_worker / fps_per_lb_;
     return *lbs_[lb_index];
 }
 

@@ -1,9 +1,10 @@
 // Tests for five-tuple identity, hashing, and the flow-affinity property the
 // load balancer depends on.
 //
-// The dispatch rule under test is the one the engine actually implements:
-//   LB  = hash(five_tuple) % num_lbs
-//   FP  = hash(five_tuple) % fps_per_lb
+// The dispatch rule under test is the one the engine implements:
+//   global_worker = hash(five_tuple) % (num_lbs * fps_per_lb)
+//   LB = global_worker / fps_per_lb
+//   FP = global_worker % fps_per_lb
 // i.e. plain modulo hashing, not consistent hashing. What it buys us is flow
 // affinity: the same 5-tuple always reaches the same worker, so per-flow state
 // stays thread-local.
@@ -28,9 +29,17 @@ FiveTuple makeTuple(uint32_t sip, uint32_t dip, uint16_t sp, uint16_t dp, uint8_
     return t;
 }
 
-// Mirrors LoadBalancer::selectFP / LBManager::getLBForPacket.
+// Mirrors the engine's global worker mapping.
 int selectWorker(const FiveTuple& t, int num_workers) {
     return static_cast<int>(FiveTupleHash{}(t) % static_cast<size_t>(num_workers));
+}
+
+int selectWorkerTwoLevel(const FiveTuple& t, int num_lbs, int fps_per_lb) {
+    const int total_workers = num_lbs * fps_per_lb;
+    const int global_worker = selectWorker(t, total_workers);
+    const int lb = global_worker / fps_per_lb;
+    const int fp = global_worker % fps_per_lb;
+    return lb * fps_per_lb + fp;
 }
 
 }  // namespace
@@ -130,6 +139,23 @@ int main() {
             if (c < 100) none_starved = false;  // deliberately loose
         }
         CHECK_MSG(none_starved, "no worker receives a negligible share of 2000 flows");
+
+        // Verify the actual two-level LB/FP mapping reaches every global worker.
+        std::set<int> two_level_used;
+        std::vector<int> two_level_counts(4, 0);
+        for (uint16_t port = 1024; port < 3024; port++) {
+            const int w = selectWorkerTwoLevel(makeTuple(0xC0A80164, 0x5DB8D822, port, 443), 2, 2);
+            two_level_used.insert(w);
+            two_level_counts[static_cast<size_t>(w)]++;
+        }
+        CHECK_EQ_MSG(two_level_used.size(), size_t{4},
+                     "2 LBs x 2 FPs reaches all 4 global workers");
+        bool two_level_balanced = true;
+        for (int c : two_level_counts) {
+            if (c < 100) two_level_balanced = false;
+        }
+        CHECK_MSG(two_level_balanced,
+                  "2 LBs x 2 FPs does not starve any global worker");
     }
 
     TEST_MAIN("flow_affinity");
