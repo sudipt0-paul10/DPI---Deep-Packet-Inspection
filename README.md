@@ -83,10 +83,14 @@ structured, not a production security appliance. See
 flowchart LR
     PCAP[("input.pcap")] --> R["<b>Reader thread</b><br/>parse headers<br/>build 5-tuple"]
 
-    R -->|hash % num_lbs| LB0["<b>LB 0</b>"]
-    R -->|hash % num_lbs| LB1["<b>LB 1</b>"]
+    R -->|5-tuple hash % total_workers| GW["<b>Global worker index</b>"]
 
-    LB0 -->|hash % fps_per_lb| FP0["<b>FP 0</b><br/>flow table"]
+    GW --> MAP["Compute lb_index and fp_index"]
+
+    MAP --> LB0["<b>LB 0</b>"]
+    MAP --> LB1["<b>LB 1</b>"]
+
+    LB0 --> FP0["<b>FP 0</b><br/>flow table"]
     LB0 --> FP1["<b>FP 1</b><br/>flow table"]
     LB1 --> FP2["<b>FP 2</b><br/>flow table"]
     LB1 --> FP3["<b>FP 3</b><br/>flow table"]
@@ -121,10 +125,10 @@ needed to read or update flow state on the hot path.
 2. **Parse** — `PacketParser` walks Ethernet → IPv4 → TCP/UDP, honouring the
    IPv4 IHL field and the TCP data-offset field, and bounds-checking each layer
    before reading it. Non-IPv4 and non-TCP/UDP packets are skipped.
-3. **Dispatch** — the reader builds the five-tuple and hands the packet to a
-   load balancer chosen by flow hash.
-4. **Balance** — the LB hashes the same five-tuple again to choose a worker
-   from its own pool.
+3. **Dispatch** — the reader builds the five-tuple and hashes it to select a
+   global fast-path worker.
+4. **Balance** — the global worker index maps directly to a load balancer and
+   its local fast-path worker queue.
 5. **Inspect** — the worker looks up (or creates) the flow, updates TCP state,
    and, if the flow is not yet classified, inspects the payload for a TLS
    ClientHello, an HTTP `Host` header, or a DNS query.
@@ -151,6 +155,16 @@ different workers. The engine tracks each direction as its own flow. This is
 asserted by [`tests/test_flow_affinity.cpp`](tests/test_flow_affinity.cpp) so
 the documentation cannot quietly drift away from the behaviour.
 
+### Flow-table management
+
+Each fast-path worker maintains its own flow table using an
+`unordered_map`. When the table reaches its configured capacity, the oldest
+entry is evicted using a FIFO index.
+
+The eviction index avoids scanning the entire flow table to find the oldest
+entry, avoiding the O(n) scan previously needed to locate the oldest entry. The
+indexed eviction path uses O(1) average-time hash-table removal.
+
 ## Threading model
 
 | Thread | Count | Job |
@@ -173,14 +187,12 @@ output PCAP contains exactly as many packets as the engine reports forwarding.
 
 ## Load balancing: 5-tuple hashing for flow affinity
 
-Worker selection is **modulo hashing**, applied at two levels:
+Worker selection uses **5-tuple hashing** to provide deterministic flow affinity.
 
 ```cpp
-// Level 1 -- reader picks the load balancer
-lb_index = FiveTupleHash{}(tuple) % num_lbs;
-
-// Level 2 -- load balancer picks the worker from its own pool
-fp_index = FiveTupleHash{}(tuple) % fps_per_lb;
+global_worker = FiveTupleHash{}(tuple) % total_workers;
+lb_index      = global_worker / fps_per_lb;
+fp_index      = global_worker % fps_per_lb;
 ```
 
 The property this buys is **flow affinity**: the hash is a pure function of the
@@ -382,7 +394,7 @@ Five executables, no external framework
 |---|---|
 | `test_packet_parser` | Ethernet/IPv4/TCP/UDP decoding, and that truncated, ARP, IPv6 and malformed frames are rejected rather than mis-parsed |
 | `test_sni_extractor` | ClientHello parsing, HTTP `Host`, DNS names, hostname→application mapping, and every truncation of a ClientHello |
-| `test_flow_affinity` | Five-tuple identity and hashing; that a flow always maps to one worker for 1–16 workers; and that the two directions of a connection can differ |
+| `test_flow_affinity` | Five-tuple identity and hashing; deterministic worker assignment across 1–16 workers; verifies all workers are reachable in multi-LB configurations; and verifies direction-sensitive flow mapping |
 | `test_rule_manager` | All four rule types, wildcard matching, rule-file parsing with comments and malformed entries, and save/load round trip |
 | `test_pipeline` | End-to-end through the real multithreaded engine: classification, blocking, output validity, drain completeness, and identical counts at 1×1, 2×2 and 4×4 workers |
 
